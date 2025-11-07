@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+firebase-admin
+google-cloud-firestore
+kiteconnect>=5.0.0
+tenacity
+pytz
+razorpay

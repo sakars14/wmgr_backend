@@ -1,0 +1,24 @@
+{
+  "buckets": [
+    { "id": "b01", "name": "Silver Exposure 01", "requiredPlan": "standard",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b02", "name": "Silver Exposure 02", "requiredPlan": "standard",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b03", "name": "Silver Exposure 03", "requiredPlan": "standard",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b04", "name": "Silver Exposure 04", "requiredPlan": "standard",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b05", "name": "Silver Exposure 05", "requiredPlan": "standard",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b06", "name": "Silver Exposure 06", "requiredPlan": "pro",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b07", "name": "Silver Exposure 07", "requiredPlan": "pro",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b08", "name": "Silver Exposure 08", "requiredPlan": "pro",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b09", "name": "Silver Exposure 09", "requiredPlan": "max",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+    { "id": "b10", "name": "Silver Exposure 10", "requiredPlan": "max",
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] }
+  ]
+}
