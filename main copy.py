@@ -33,7 +33,8 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 # FastAPI app (create ONCE)
 app = FastAPI(title="WMGR API")
 
-# Razorpay details
+#Razorpay details
+
 client = razorpay.Client(auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]))
 
 PLAN_PRICE_PAISE = {
@@ -42,8 +43,9 @@ PLAN_PRICE_PAISE = {
     "max":      99900   # ₹999
 }
 
+
 # CORS: allow both localhost & 127.0.0.1 plus explicit APP_BASE_URL
-_default_webs = ["http://127.0.0.1:3000", "http://localhost:3000", "https://wmgr-web.vercel.app"]
+_default_webs = ["http://127.0.0.1:3000", "http://localhost:3000","https://wmgr-web.vercel.app"]
 _app_base = os.getenv("APP_BASE_URL")
 allow_origins = _default_webs if not _app_base else list(set(_default_webs + [_app_base]))
 
@@ -122,7 +124,6 @@ def get_user_ctx(authorization: Optional[str] = Header(None)) -> Dict:
             return fb_auth.verify_id_token(token)
         raise HTTPException(401, f"Invalid token: {e}")
 
-
 def init_firebase():
     if firebase_admin._apps:
         return  # already initialized (hot restarts)
@@ -163,15 +164,16 @@ def require_admin(ctx: Dict = Depends(get_user_ctx)):
         raise HTTPException(403, "Not allowed")
     return ctx
 
-
 # ---------- Probes ----------
 @app.get("/")
 def root():
     return {"ok": True, "service": "wmgr-api", "cors": allow_origins}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.get("/dev/whoami")
 def whoami(uid: str = Depends(get_uid)):
@@ -183,6 +185,7 @@ def whoami(uid: str = Depends(get_uid)):
         "admin_matches": ((u.email or "").strip().lower()
                           == (os.getenv("ADMIN_EMAIL", "").strip().lower()))
     }
+
 
 @app.get("/market/status")
 def market_status():
@@ -196,6 +199,7 @@ def market_status():
 @app.get("/buckets")
 def list_buckets(uid: str = Depends(get_uid)):
     return {"buckets": load_buckets()}
+
 
 @app.get("/buckets/{bucket_id}")
 def bucket_detail(bucket_id: str, uid: str = Depends(get_uid)):
@@ -224,11 +228,6 @@ def zerodha_login(uid: str = Depends(get_uid)):
     login_url = k.login_url() + "&redirect_url=" + quote(redirect_with_uid, safe="") + "&state=" + uid
     return {"loginUrl": login_url}
 
-# Convenience: redirect the browser straight to Kite login (handy for testing from address bar)
-@app.get("/auth/zerodha/login/redirect")
-def zerodha_login_redirect(uid: str = Depends(get_uid)):
-    data = zerodha_login(uid=uid)
-    return RedirectResponse(url=data["loginUrl"], status_code=302)
 
 @app.get("/auth/zerodha/callback")
 def zerodha_callback(request: Request):
@@ -262,23 +261,16 @@ def zerodha_callback(request: Request):
         # if anything goes wrong, show structured error
         return {"ok": False, "stage": "exception", "error": str(e), "params": params}
 
-# --- Zerodha aliases so your Render URL matches Zerodha console entries exactly ---
-@app.get("/zerodha/login")
-def zerodha_login_alias(uid: str = Depends(get_uid)):
-    return zerodha_login(uid)
-
-@app.get("/zerodha/callback")
-def zerodha_callback_alias(request: Request):
-    return zerodha_callback(request)
-
 
 # ---------- Orders (Plan-gated + AMO buffer) ----------
+
 PLAN_LIMIT = {"none": 0, "standard": 5, "pro": 8, "max": 10}
 
 def _derive_rank(bucket_id: str) -> int:
     """Extract a numeric order (1..N) from bucket id/name for gating."""
     m = re.search(r"(\d+)", bucket_id or "")
     return int(m.group(1)) if m else 999
+
 
 @app.post("/orders/group", response_model=OrderGroupResponse)
 def create_order_group(payload: CreateOrderGroupRequest, auth: dict = Depends(get_auth)):
@@ -427,10 +419,10 @@ def create_billing_order(body: Dict, ctx: Dict = Depends(get_user_ctx)):
         raise HTTPException(400, "Unknown plan")
 
     uid = ctx["uid"]
-    client_local = _rzp_client()
+    client = _rzp_client()
 
     receipt = f"sub_{uid[:8]}_{int(time.time())}"
-    order = client_local.order.create({
+    order = client.order.create({
         "amount": amount,
         "currency": BILLING_CCY,
         "receipt": receipt,
@@ -525,7 +517,7 @@ async def razorpay_webhook(request: Request):
     return {"ok": True}
 
 
-# ---- admin console endpoints ----
+#----admin console endpoints ----
 @app.get("/admin/metrics")
 def admin_metrics(ctx: Dict = Depends(get_user_ctx)):
     admin_email = os.getenv("ADMIN_EMAIL", "")
@@ -547,20 +539,16 @@ def admin_metrics(ctx: Dict = Depends(get_user_ctx)):
         },
         "last10": []
     }
-    for doc in db.collection("subscriptions_index").order_by(
-        "createdAt", direction=firestore.Query.DESCENDING
-    ).limit(10).stream():
+    for doc in db.collection("subscriptions_index").order_by("createdAt", direction=firestore.Query.DESCENDING).limit(10).stream():
         d = doc.to_dict()
         out["last10"].append({
             "uid": d.get("uid"),
             "plan": d.get("plan"),
             "status": d.get("status"),
             "amount": d.get("amount"),
-            "when": d.get("createdAt", None).__class__.__name__ == "Timestamp"
-                    and d["createdAt"].isoformat() or "",
+            "when": d.get("createdAt", None).__class__.__name__ == "Timestamp" and d["createdAt"].isoformat() or "",
         })
     return out
-
 @app.get("/admin/stats")
 def admin_stats(_: Dict = Depends(require_admin)):
     # lightweight counts for now
