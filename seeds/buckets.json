@@ -1,7 +1,8 @@
 {
   "buckets": [
     { "id": "b01", "name": "Silver Exposure 01", "requiredPlan": "standard",
-      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
+      "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" },
+               { "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
     { "id": "b02", "name": "Silver Exposure 02", "requiredPlan": "standard",
       "legs": [{ "exchange": "NSE", "symbol": "SILVERCASE", "defaultQty": 5, "product": "CNC", "priceType": "MARKET" }] },
     { "id": "b03", "name": "Silver Exposure 03", "requiredPlan": "standard",

@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 import firebase_admin
 from firebase_admin import credentials, auth as fb_auth
 from google.cloud import firestore
@@ -27,20 +27,23 @@ from models import CreateOrderGroupRequest, OrderGroupResponse
 from market_time import choose_order_mode
 
 
+
 # ---------- Boot ----------
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
 
 # FastAPI app (create ONCE)
 app = FastAPI(title="WMGR API")
 
+
+
 # Razorpay details
 client = razorpay.Client(auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]))
 
-PLAN_PRICE_PAISE = {
-    "standard": 19900,  # ₹199 → paise
-    "pro":      49900,  # ₹499
-    "max":      99900   # ₹999
-}
+#PLAN_PRICE_PAISE = {
+#    "standard": 19900,  # ₹199 → paise
+#    "pro":      49900,  # ₹499
+#    "max":      99900   # ₹999
+#}
 
 # CORS: allow both localhost & 127.0.0.1 plus explicit APP_BASE_URL
 _default_webs = ["http://127.0.0.1:3000", "http://localhost:3000", "https://wmgr-web.vercel.app"]
@@ -66,6 +69,8 @@ if not firebase_admin._apps:
 # Firestore client
 db = firestore.Client()
 
+from app.routers import plans
+app.include_router(plans.router)
 
 # ---------- Helpers ----------
 def get_uid(authorization: Optional[str] = Header(None)) -> str:
@@ -156,12 +161,33 @@ def _rzp_client():
 def _now_ist():
     return datetime.now(ZoneInfo("Asia/Kolkata"))
 
-def require_admin(ctx: Dict = Depends(get_user_ctx)):
-    admin_email = (os.getenv("ADMIN_EMAIL","").strip().lower())
-    is_admin = ctx.get("admin", False) or (ctx.get("email","").strip().lower() == admin_email)
-    if not is_admin:
-        raise HTTPException(403, "Not allowed")
-    return ctx
+def _csv_set(env_name: str) -> set[str]:
+    raw = os.getenv(env_name) or ""
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+def require_admin(ctx=Depends(get_user_ctx)):
+    # Allow admin via:
+    # 1) Firebase custom claim: admin=true
+    # 2) Email allowlist: ADMIN_EMAILS or ADMIN_EMAIL
+    # 3) UID allowlist: ADMIN_UIDS
+    if ctx.get("admin") is True:
+        return ctx
+
+    emails = _csv_set("ADMIN_EMAILS")
+    single = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+    if single:
+        emails.add(single)
+
+    uids = _csv_set("ADMIN_UIDS")
+
+    email = (ctx.get("email") or "").strip().lower()
+    uid = (ctx.get("uid") or "").strip()  # don't lower uid
+
+    if (email and email in emails) or (uid and uid in uids):
+        return ctx
+
+    raise HTTPException(status_code=403, detail="Admin only")
+
 
 
 # ---------- Probes ----------
@@ -191,7 +217,6 @@ def market_status():
     is_open = (now.weekday() < 5) and (dtime(9, 15) <= now.time() <= dtime(15, 30))
     return {"isOpen": is_open, "nowIst": now.isoformat()}
 
-
 # ---------- Buckets ----------
 @app.get("/buckets")
 def list_buckets(uid: str = Depends(get_uid)):
@@ -199,11 +224,44 @@ def list_buckets(uid: str = Depends(get_uid)):
 
 @app.get("/buckets/{bucket_id}")
 def bucket_detail(bucket_id: str, uid: str = Depends(get_uid)):
+    """
+    Return a single bucket and enrich each leg with live price (ltp) if Zerodha works.
+    """
+    bucket = None
     for b in load_buckets():
         if b["id"] == bucket_id:
-            return b
-    raise HTTPException(404, "Bucket not found")
+            bucket = b
+            break
 
+    if bucket is None:
+        raise HTTPException(404, "Bucket not found")
+
+    adapter = ZerodhaAdapter(db)
+    legs = bucket.get("legs", [])
+
+    priced_legs = []
+    price_error: str | None = None
+
+    for leg in legs:
+        ex = leg.get("exchange", "NSE")
+        sym = leg["symbol"]
+        try:
+            ltp = adapter.get_ltp(uid, ex, sym)
+        except Exception as e:
+            ltp = None
+            if price_error is None:
+                price_error = str(e)
+        priced_legs.append({**leg, "ltp": ltp})
+
+    result = {
+        **bucket,
+        "legs": priced_legs,
+        "items": priced_legs,  # for the frontend mapping
+    }
+    if price_error:
+        result["priceError"] = price_error
+
+    return result
 
 # ---------- Zerodha OAuth ----------
 @app.get("/auth/zerodha/login")
@@ -271,9 +329,47 @@ def zerodha_login_alias(uid: str = Depends(get_uid)):
 def zerodha_callback_alias(request: Request):
     return zerodha_callback(request)
 
+@app.get("/zerodha/status")
+def zerodha_status(uid: str = Depends(get_uid)):
+    """
+    Lightweight check: try to fetch LTP for the first configured leg.
+    If it succeeds, Zerodha is effectively 'connected' for this user.
+    """
+    adapter = ZerodhaAdapter(db)
+
+    # Pick any one instrument from your buckets as a probe
+    buckets = load_buckets()
+    probe_leg = None
+    for b in buckets:
+        legs = b.get("legs", [])
+        if legs:
+            probe_leg = legs[0]
+            break
+
+    if not probe_leg:
+        return {"connected": None, "error": "No bucket legs configured"}
+
+    ex = probe_leg.get("exchange", "NSE")
+    sym = probe_leg["symbol"]
+
+    try:
+        ltp = adapter.get_ltp(uid, ex, sym)
+        return {
+            "connected": True,
+            "exchange": ex,
+            "symbol": sym,
+            "ltp": ltp,
+        }
+    except Exception as e:
+        return {
+            "connected": False,
+            "exchange": ex,
+            "symbol": sym,
+            "error": str(e),
+        }
 
 # ---------- Orders (Plan-gated + AMO buffer) ----------
-PLAN_LIMIT = {"none": 0, "standard": 5, "pro": 8, "max": 10}
+#PLAN_LIMIT = {"none": 0, "standard": 5, "pro": 8, "max": 10}
 
 def _derive_rank(bucket_id: str) -> int:
     """Extract a numeric order (1..N) from bucket id/name for gating."""
@@ -408,11 +504,15 @@ def grant_plan(plan: str, ctx: Dict = Depends(get_user_ctx)):
     return {"ok": True, "plan": plan}
 
 PLAN_PRICING = {
-    "standard": 19900,   # ₹199.00
-    "pro":      49900,   # ₹499.00
-    "max":      99900,   # ₹999.00
+    # These are amounts in paise → Razorpay sees them as 1000 / 3000 / 5000 INR
+    "standard": 100000,   # ₹1,000.00  (Safety plan)
+    "pro":      300000,   # ₹3,000.00  (Balanced plan)
+    "max":      500000,   # ₹5,000.00  (Growth plan)
 }
+
+# You can fine-tune unlock limits later if you use them for feature-gating
 UNLOCK_LIMIT = {"standard": 5, "pro": 8, "max": 10}
+
 
 # ---------- BILLING ----------
 @app.post("/billing/order")
@@ -527,10 +627,8 @@ async def razorpay_webhook(request: Request):
 
 # ---- admin console endpoints ----
 @app.get("/admin/metrics")
-def admin_metrics(ctx: Dict = Depends(get_user_ctx)):
-    admin_email = os.getenv("ADMIN_EMAIL", "")
-    if not admin_email or ctx.get("email") != admin_email:
-        raise HTTPException(403, "Not allowed")
+def admin_metrics(_: Dict = Depends(require_admin)):
+
 
     def count(plan):
         return len(list(
@@ -539,12 +637,24 @@ def admin_metrics(ctx: Dict = Depends(get_user_ctx)):
               .where("status","==","active").stream()
         ))
 
+    active_counts = {
+        "standard": count("standard"),
+        "pro": count("pro"),
+        "max": count("max"),
+    }
+    # Lightweight summary expected by frontend
+    buckets = load_buckets()
+    buckets_count = len(buckets.get("buckets", [])) if isinstance(buckets, dict) else 0
+    try:
+        payments_count = sum(1 for _ in db.collection("subscription_intents").stream())
+    except Exception:
+        payments_count = 0
+
     out = {
-        "active": {
-            "standard": count("standard"),
-            "pro": count("pro"),
-            "max": count("max"),
-        },
+        "bucketsCount": buckets_count,
+        "activeSubsCount": sum(active_counts.values()),
+        "paymentsCount": payments_count,
+        "active": active_counts,
         "last10": []
     }
     for doc in db.collection("subscriptions_index").order_by(
