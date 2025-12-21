@@ -12,6 +12,8 @@ from firebase_admin import credentials, firestore
 
 from app.routers.auth import get_current_user
 from app.planner.engine import generate_plans
+from app.planner.deterministic import build_financial_blueprint
+from app.llm.narrator import generate_narration, NarrationResponse
 
 router = APIRouter(tags=["plans"])
 
@@ -100,10 +102,27 @@ class RecommendationsRequest(BaseModel):
     profile: Optional[Dict[str, Any]] = None
 
 
+class BlueprintRequest(BaseModel):
+    # If provided and != caller uid, caller must be admin
+    clientId: Optional[str] = None
+
+    # Optional override for dev/testing (if you want to POST raw profile)
+    profile: Optional[Dict[str, Any]] = None
+
+
+class NarrationRequest(BaseModel):
+    # If provided and != caller uid, caller must be admin
+    clientId: Optional[str] = None
+
+    # Optional override for dev/testing (if you want to POST raw profile)
+    profile: Optional[Dict[str, Any]] = None
+
+
 @router.post("/plans/recommendations")
 def plans_recommendations(
     req: RecommendationsRequest,
     user: Dict[str, Any] = Depends(get_current_user),
+    includeNarration: bool = False,
 ):
     db = _ensure_firebase_db()
 
@@ -127,6 +146,7 @@ def plans_recommendations(
 
     # 2) Generate deterministic plan model
     plan_model = generate_plans(profile)
+    blueprint = build_financial_blueprint(profile)
 
     # 3) Persist it (shared defaults to existing shared if present)
     ref = db.collection("clientPlans").document(target_uid)
@@ -147,11 +167,147 @@ def plans_recommendations(
             "shared": existing_shared,
             "updatedAt": firestore.SERVER_TIMESTAMP,
             "plan": plan_model,
+            "blueprint": blueprint,
+            "blueprintVersion": blueprint.get("meta", {}).get("blueprintVersion", "phase1-blueprint-v1"),
         },
         merge=True,
     )
 
-    return plan_model
+    plan_response = dict(plan_model)
+    plan_response["blueprint"] = blueprint
+    if includeNarration:
+        narration = generate_narration(blueprint, plan_model)
+        narration_payload = narration.dict()
+        ref.set(
+            {
+                "llmNarration": narration_payload,
+                "narrationVersion": narration.narrationVersion,
+                "narrationUpdatedAt": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        plan_response["llmNarration"] = narration_payload
+    return plan_response
+
+
+@router.post("/plans/narration", response_model=NarrationResponse)
+def plans_narration(
+    req: NarrationRequest,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    db = _ensure_firebase_db()
+
+    caller_uid = _get_uid(user)
+    if not caller_uid:
+        raise HTTPException(status_code=401, detail="Unauthenticated")
+
+    target_uid = caller_uid
+    if req.clientId and req.clientId != caller_uid:
+        _require_admin(db, user)
+        target_uid = req.clientId
+
+    # 1) Build input profile
+    if req.profile is not None:
+        profile = req.profile
+    else:
+        snap = db.collection("clientProfiles").document(target_uid).get()
+        if not snap.exists:
+            raise HTTPException(status_code=404, detail=f"clientProfiles/{target_uid} not found")
+        profile = snap.to_dict()
+
+    ref = db.collection("clientPlans").document(target_uid)
+    existing = ref.get()
+    existing_data = existing.to_dict() if existing.exists else {}
+    existing_shared = bool(existing_data.get("shared", False))
+
+    # 2) Reuse stored blueprint/plan if available
+    blueprint = existing_data.get("blueprint")
+    plan_model = existing_data.get("plan")
+    generated_plan = False
+    generated_blueprint = False
+
+    if not blueprint:
+        blueprint = build_financial_blueprint(profile)
+        generated_blueprint = True
+    if not plan_model:
+        plan_model = generate_plans(profile)
+        generated_plan = True
+
+    # 3) Generate narration
+    narration = generate_narration(blueprint, plan_model)
+
+    client_name = ""
+    personal = (profile.get("personal") or {})
+    if isinstance(personal, dict):
+        client_name = personal.get("name", "") or ""
+
+    update_payload: Dict[str, Any] = {
+        "clientId": target_uid,
+        "clientName": client_name,
+        "shared": existing_shared,
+        "plan": plan_model,
+        "blueprint": blueprint,
+        "blueprintVersion": blueprint.get("meta", {}).get("blueprintVersion", "phase1-blueprint-v1"),
+        "llmNarration": narration.dict(),
+        "narrationVersion": narration.narrationVersion,
+        "narrationUpdatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    if generated_plan or generated_blueprint:
+        update_payload["updatedAt"] = firestore.SERVER_TIMESTAMP
+
+    ref.set(update_payload, merge=True)
+    return narration
+
+
+@router.post("/plans/blueprint")
+def plans_blueprint(
+    req: BlueprintRequest,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    db = _ensure_firebase_db()
+
+    caller_uid = _get_uid(user)
+    if not caller_uid:
+        raise HTTPException(status_code=401, detail="Unauthenticated")
+
+    target_uid = caller_uid
+    if req.clientId and req.clientId != caller_uid:
+        _require_admin(db, user)
+        target_uid = req.clientId
+
+    if req.profile is not None:
+        profile = req.profile
+    else:
+        snap = db.collection("clientProfiles").document(target_uid).get()
+        if not snap.exists:
+            raise HTTPException(status_code=404, detail=f"clientProfiles/{target_uid} not found")
+        profile = snap.to_dict()
+
+    blueprint = build_financial_blueprint(profile)
+
+    ref = db.collection("clientPlans").document(target_uid)
+    existing = ref.get()
+    existing_data = existing.to_dict() if existing.exists else {}
+    existing_shared = bool(existing_data.get("shared", False))
+
+    client_name = ""
+    personal = (profile.get("personal") or {})
+    if isinstance(personal, dict):
+        client_name = personal.get("name", "") or ""
+
+    ref.set(
+        {
+            "clientId": target_uid,
+            "clientName": client_name,
+            "shared": existing_shared,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "blueprint": blueprint,
+            "blueprintVersion": blueprint.get("meta", {}).get("blueprintVersion", "phase1-blueprint-v1"),
+        },
+        merge=True,
+    )
+
+    return blueprint
 
 
 # -------------------------

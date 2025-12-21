@@ -4,6 +4,7 @@ python-dotenv
 pydantic
 firebase-admin
 google-cloud-firestore
+openai
 kiteconnect>=5.0.0
 tenacity
 pytz

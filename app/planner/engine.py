@@ -1,6 +1,7 @@
 from typing import Dict, Any, List, Literal, Tuple
 from dataclasses import dataclass
 from .deterministic import build_financial_blueprint
+from .emi import get_total_monthly_emi
 
 
 RiskBand = Literal["Conservative", "Balanced", "Aggressive"]
@@ -62,7 +63,6 @@ def _safe_float(v: Any) -> float:
 def compute_income_metrics(profile: Dict[str, Any]) -> Dict[str, float]:
     personal = profile.get("personal", {})
     cash_flow = profile.get("cashFlow", {})
-    liabilities = profile.get("liabilities", {})
 
     monthly_income_in_hand = _safe_float(personal.get("monthlyIncomeInHand"))
     annual_bonus = _safe_float(personal.get("annualBonus"))
@@ -75,19 +75,7 @@ def compute_income_metrics(profile: Dict[str, Any]) -> Dict[str, float]:
 
     total_monthly_expense = _safe_float(cash_flow.get("totalMonthlyExpense"))
 
-    # EMIs – adjust field names to match your Firestore doc
-    emi_fields = [
-        "homeLoan1Emi",
-        "homeLoan2Emi",
-        "personalLoan1Emi",
-        "personalLoan2Emi",
-        "vehicleLoanEmi",
-        "loanAgainstSharesEmi",
-        "creditCard1Emi",
-        "creditCard2Emi",
-        "otherLoanEmi",
-    ]
-    total_monthly_emi = sum(_safe_float(liabilities.get(f, 0)) for f in emi_fields)
+    total_monthly_emi = get_total_monthly_emi(profile)
 
     monthly_savings = monthly_income_total - total_monthly_expense - total_monthly_emi
 
