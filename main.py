@@ -6,18 +6,19 @@ import re
 import uuid
 import json
 import time
+import base64
 import hmac, hashlib
 import razorpay
 from datetime import timedelta
-from typing import Optional, Dict
-from urllib.parse import quote
+from typing import Dict
+from urllib.parse import quote, urlencode
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
 import firebase_admin
 from firebase_admin import credentials, auth as fb_auth
 from google.cloud import firestore
@@ -69,41 +70,13 @@ if not firebase_admin._apps:
 # Firestore client
 db = firestore.Client()
 
+from app.deps.authz import get_user_ctx, get_uid, require_admin, is_admin
 from app.routers import plans
+from app.routers import model_buckets
 app.include_router(plans.router)
+app.include_router(model_buckets.router)
 
 # ---------- Helpers ----------
-def get_uid(authorization: Optional[str] = Header(None)) -> str:
-    """Verify Firebase ID token from 'Authorization: Bearer <token>' and return uid."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing Bearer token")
-    token = authorization.split(" ", 1)[1]
-    try:
-        decoded = fb_auth.verify_id_token(token)
-    except Exception as e:
-        # tiny clock skew tolerance
-        if "Token used too early" in str(e):
-            time.sleep(1)
-            decoded = fb_auth.verify_id_token(token)
-        else:
-            raise HTTPException(401, f"Invalid token: {e}")
-    return decoded["uid"]
-
-
-def get_auth(authorization: Optional[str] = Header(None)) -> dict:
-    """Return full decoded Firebase token (uid + email + custom claims)."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing Bearer token")
-    token = authorization.split(" ", 1)[1]
-    try:
-        return fb_auth.verify_id_token(token)
-    except Exception as e:
-        if "Token used too early" in str(e):
-            time.sleep(1)
-            return fb_auth.verify_id_token(token)
-        raise HTTPException(401, f"Invalid token: {e}")
-
-
 def load_buckets():
     """Read demo buckets from seeds/buckets.json."""
     p = os.path.join(os.path.dirname(__file__), "seeds", "buckets.json")
@@ -111,21 +84,6 @@ def load_buckets():
         return {"buckets": []}
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)["buckets"]
-
-
-# helper that returns full decoded token (uid + email + claims)
-def get_user_ctx(authorization: Optional[str] = Header(None)) -> Dict:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing Bearer token")
-    token = authorization.split(" ", 1)[1]
-    try:
-        decoded = fb_auth.verify_id_token(token)
-        return decoded
-    except Exception as e:
-        if "Token used too early" in str(e):
-            time.sleep(1)
-            return fb_auth.verify_id_token(token)
-        raise HTTPException(401, f"Invalid token: {e}")
 
 
 def init_firebase():
@@ -161,33 +119,6 @@ def _rzp_client():
 def _now_ist():
     return datetime.now(ZoneInfo("Asia/Kolkata"))
 
-def _csv_set(env_name: str) -> set[str]:
-    raw = os.getenv(env_name) or ""
-    return {x.strip().lower() for x in raw.split(",") if x.strip()}
-
-def require_admin(ctx=Depends(get_user_ctx)):
-    # Allow admin via:
-    # 1) Firebase custom claim: admin=true
-    # 2) Email allowlist: ADMIN_EMAILS or ADMIN_EMAIL
-    # 3) UID allowlist: ADMIN_UIDS
-    if ctx.get("admin") is True:
-        return ctx
-
-    emails = _csv_set("ADMIN_EMAILS")
-    single = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
-    if single:
-        emails.add(single)
-
-    uids = _csv_set("ADMIN_UIDS")
-
-    email = (ctx.get("email") or "").strip().lower()
-    uid = (ctx.get("uid") or "").strip()  # don't lower uid
-
-    if (email and email in emails) or (uid and uid in uids):
-        return ctx
-
-    raise HTTPException(status_code=403, detail="Admin only")
-
 
 
 # ---------- Probes ----------
@@ -200,15 +131,33 @@ def health():
     return {"ok": True}
 
 @app.get("/dev/whoami")
-def whoami(uid: str = Depends(get_uid)):
-    u = fb_auth.get_user(uid)
+def whoami(ctx: Dict = Depends(get_user_ctx)):
+    is_admin_flag, reason = is_admin(ctx)
     return {
-        "uid": uid,
-        "email": u.email,
-        "claims": u.custom_claims or {},
-        "admin_matches": ((u.email or "").strip().lower()
-                          == (os.getenv("ADMIN_EMAIL", "").strip().lower()))
+        "uid": ctx.get("uid"),
+        "email": ctx.get("email"),
+        "is_admin": is_admin_flag,
+        "admin_reason": reason,
     }
+
+@app.post("/dev/make-me-admin")
+def make_me_admin(ctx: Dict = Depends(get_user_ctx)):
+    if os.getenv("ALLOW_DEV_ADMIN_BOOTSTRAP") != "1":
+        raise HTTPException(status_code=403, detail="Admin bootstrap disabled")
+
+    uid = ctx.get("uid")
+    email = ctx.get("email")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Unauthenticated")
+
+    db.collection("admins").document(uid).set(
+        {
+            "enabled": True,
+            "email": email,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        }
+    )
+    return {"ok": True, "uid": uid, "email": email}
 
 @app.get("/market/status")
 def market_status():
@@ -263,9 +212,86 @@ def bucket_detail(bucket_id: str, uid: str = Depends(get_uid)):
 
     return result
 
+# ---------- Zerodha helpers ----------
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(val: str) -> bytes:
+    padded = val + "=" * (-len(val) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _get_zerodha_state_secret() -> str:
+    return os.getenv("ZERODHA_STATE_SECRET") or os.getenv("ZERODHA_API_SECRET") or ""
+
+
+def _sanitize_return_to(value: str | None) -> str | None:
+    if not value:
+        return None
+    if "://" in value:
+        return None
+    if not value.startswith("/"):
+        return None
+    return value
+
+
+def _make_zerodha_state(uid: str, return_to: str | None) -> str:
+    payload = {"uid": uid}
+    if return_to:
+        payload["returnTo"] = return_to
+    payload_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    payload_b64 = _b64url_encode(payload_json)
+    secret = _get_zerodha_state_secret()
+    if not secret:
+        return payload_b64
+    sig = hmac.new(secret.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+def _parse_zerodha_state(state: str):
+    if not state:
+        return None
+    if "." not in state:
+        try:
+            payload = json.loads(_b64url_decode(state))
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+    payload_b64, sig = state.rsplit(".", 1)
+    secret = _get_zerodha_state_secret()
+    if not secret:
+        return None
+    expected = hmac.new(secret.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(payload_b64))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _ts_to_iso(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "to_datetime"):
+        try:
+            return value.to_datetime().isoformat()
+        except Exception:
+            return None
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return None
+    return None
+
 # ---------- Zerodha OAuth ----------
 @app.get("/auth/zerodha/login")
-def zerodha_login(uid: str = Depends(get_uid)):
+def zerodha_login(request: Request, uid: str = Depends(get_uid)):
     from kiteconnect import KiteConnect
 
     api_key = os.getenv("ZERODHA_API_KEY")
@@ -277,15 +303,24 @@ def zerodha_login(uid: str = Depends(get_uid)):
 
     k = KiteConnect(api_key=api_key)
 
-    # Carry uid via redirect_url and also put it in state
-    redirect_with_uid = f"{base_redirect}?uid={uid}"
-    login_url = k.login_url() + "&redirect_url=" + quote(redirect_with_uid, safe="") + "&state=" + uid
+    return_to = _sanitize_return_to(request.query_params.get("returnTo"))
+    redirect_params = {"uid": uid}
+    if return_to:
+        redirect_params["returnTo"] = return_to
+    sep = "&" if "?" in base_redirect else "?"
+    redirect_with_uid = base_redirect + sep + urlencode(redirect_params, safe="/")
+    state = _make_zerodha_state(uid, return_to)
+    login_url = (
+        k.login_url()
+        + "&redirect_url=" + quote(redirect_with_uid, safe="")
+        + "&state=" + quote(state, safe="")
+    )
     return {"loginUrl": login_url}
 
 # Convenience: redirect the browser straight to Kite login (handy for testing from address bar)
 @app.get("/auth/zerodha/login/redirect")
-def zerodha_login_redirect(uid: str = Depends(get_uid)):
-    data = zerodha_login(uid=uid)
+def zerodha_login_redirect(request: Request, uid: str = Depends(get_uid)):
+    data = zerodha_login(request=request, uid=uid)
     return RedirectResponse(url=data["loginUrl"], status_code=302)
 
 @app.get("/auth/zerodha/callback")
@@ -294,7 +329,17 @@ def zerodha_callback(request: Request):
 
     params = dict(request.query_params)
     request_token = params.get("request_token")
-    uid = params.get("uid") or params.get("state")  # accept either
+    uid = params.get("uid")
+    return_to = params.get("returnTo")
+    state = params.get("state")
+    if state:
+        parsed = _parse_zerodha_state(state)
+        if parsed:
+            uid = parsed.get("uid") or uid
+            return_to = parsed.get("returnTo") or return_to
+        elif not uid and "." not in state:
+            uid = state
+    return_to = _sanitize_return_to(return_to) or "/buckets"
 
     if not request_token:
         return {"ok": False, "stage": "callback", "error": "Missing request_token", "params": params}
@@ -308,13 +353,33 @@ def zerodha_callback(request: Request):
         if not access_token:
             return {"ok": False, "stage": "generate_session", "error": "No access token", "data": data}
 
+        email = None
+        try:
+            user_record = fb_auth.get_user(uid)
+            email = user_record.email
+        except Exception:
+            email = None
+
+        db.collection("zerodhaConnections").document(uid).set(
+            {
+                "uid": uid,
+                "email": email,
+                "kiteUserId": data.get("user_id"),
+                "accessToken": access_token,
+                "connected": True,
+                "connectedAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
         db.collection("users").document(uid).collection("brokerLinks").document("zerodha").set(
             {"accessToken": access_token, "createdAt": firestore.SERVER_TIMESTAMP}
         )
 
-        # 👇 Redirect the browser to your frontend buckets page
+        # dY`? Redirect the browser to your frontend buckets page
         app_base = os.getenv("APP_BASE_URL", "http://127.0.0.1:3000")
-        return RedirectResponse(url=f"{app_base}/buckets?connected=1", status_code=302)
+        return RedirectResponse(url=f"{app_base}{return_to}", status_code=302)
 
     except Exception as e:
         # if anything goes wrong, show structured error
@@ -322,54 +387,126 @@ def zerodha_callback(request: Request):
 
 # --- Zerodha aliases so your Render URL matches Zerodha console entries exactly ---
 @app.get("/zerodha/login")
-def zerodha_login_alias(uid: str = Depends(get_uid)):
-    return zerodha_login(uid)
+def zerodha_login_alias(request: Request, uid: str = Depends(get_uid)):
+    return zerodha_login(request=request, uid=uid)
 
 @app.get("/zerodha/callback")
 def zerodha_callback_alias(request: Request):
     return zerodha_callback(request)
 
-@app.get("/zerodha/status")
-def zerodha_status(uid: str = Depends(get_uid)):
-    """
-    Lightweight check: try to fetch LTP for the first configured leg.
-    If it succeeds, Zerodha is effectively 'connected' for this user.
-    """
+def _zerodha_status(ctx: Dict):
+    uid = ctx.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Unauthenticated")
+
+    doc_ref = db.collection("zerodhaConnections").document(uid)
+    doc = doc_ref.get()
+    data = doc.to_dict() if doc.exists else {}
+
     adapter = ZerodhaAdapter(db)
-
-    # Pick any one instrument from your buckets as a probe
-    buckets = load_buckets()
-    probe_leg = None
-    for b in buckets:
-        legs = b.get("legs", [])
-        if legs:
-            probe_leg = legs[0]
-            break
-
-    if not probe_leg:
-        return {"connected": None, "error": "No bucket legs configured"}
-
-    ex = probe_leg.get("exchange", "NSE")
-    sym = probe_leg["symbol"]
+    connected = False
+    reason = "no_record"
+    error = None
 
     try:
-        ltp = adapter.get_ltp(uid, ex, sym)
-        return {
-            "connected": True,
-            "exchange": ex,
-            "symbol": sym,
-            "ltp": ltp,
-        }
+        adapter.margins(uid)
+        connected = True
+        reason = "ok"
     except Exception as e:
-        return {
-            "connected": False,
-            "exchange": ex,
-            "symbol": sym,
-            "error": str(e),
-        }
+        connected = False
+        error = str(e)
+        reason = "token_invalid" if doc.exists else "no_record"
+
+    if connected:
+        if doc.exists:
+            doc_ref.set(
+                {"connected": True, "updatedAt": firestore.SERVER_TIMESTAMP, "lastValidatedAt": firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+        else:
+            try:
+                token = adapter._get_access_token(uid)
+            except Exception:
+                token = None
+            if token:
+                doc_ref.set(
+                    {
+                        "uid": uid,
+                        "email": ctx.get("email"),
+                        "accessToken": token,
+                        "connected": True,
+                        "connectedAt": firestore.SERVER_TIMESTAMP,
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                        "lastValidatedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+    else:
+        if doc.exists:
+            doc_ref.set(
+                {"connected": False, "updatedAt": firestore.SERVER_TIMESTAMP, "lastValidatedAt": firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+
+    out = {"connected": connected, "reason": reason}
+    if data:
+        kite_user_id = data.get("kiteUserId")
+        updated_at = _ts_to_iso(data.get("updatedAt"))
+        connected_at = _ts_to_iso(data.get("connectedAt"))
+        if kite_user_id:
+            out["kiteUserId"] = kite_user_id
+        if updated_at:
+            out["updatedAt"] = updated_at
+        if connected_at:
+            out["connectedAt"] = connected_at
+    if not connected and error:
+        out["error"] = error
+    return out
+
+@app.get("/auth/zerodha/status")
+@app.get("/zerodha/status")
+def zerodha_status(ctx: Dict = Depends(get_user_ctx)):
+    return _zerodha_status(ctx)
+
+@app.post("/zerodha/quotes")
+def zerodha_quotes(body: Dict, ctx: Dict = Depends(get_user_ctx)):
+    instruments = (body or {}).get("instruments") or []
+    if not isinstance(instruments, list) or not instruments:
+        raise HTTPException(status_code=400, detail="Missing instruments")
+    adapter = ZerodhaAdapter(db)
+    try:
+        prices = adapter.get_quotes(ctx["uid"], instruments)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Zerodha not connected: {e}")
+    return {"prices": prices}
+
+@app.get("/admin/zerodha-status")
+def admin_zerodha_status(uids: str = "", _: Dict = Depends(require_admin)):
+    raw = [u.strip() for u in (uids or "").split(",") if u.strip()]
+    if not raw:
+        return {"statuses": {}}
+
+    doc_refs = [db.collection("zerodhaConnections").document(uid) for uid in raw]
+    statuses = {}
+    for doc in db.get_all(doc_refs):
+        if not doc.exists:
+            statuses[doc.id] = {"connected": False}
+            continue
+        data = doc.to_dict() or {}
+        entry = {"connected": bool(data.get("connected"))}
+        updated_at = _ts_to_iso(data.get("updatedAt"))
+        if updated_at:
+            entry["updatedAt"] = updated_at
+        statuses[doc.id] = entry
+
+    for uid in raw:
+        if uid not in statuses:
+            statuses[uid] = {"connected": False}
+
+    return {"statuses": statuses}
 
 # ---------- Orders (Plan-gated + AMO buffer) ----------
-#PLAN_LIMIT = {"none": 0, "standard": 5, "pro": 8, "max": 10}
+PLAN_LIMIT = {"none": 0, "standard": 5, "pro": 8, "max": 10}
 
 def _derive_rank(bucket_id: str) -> int:
     """Extract a numeric order (1..N) from bucket id/name for gating."""
@@ -377,7 +514,7 @@ def _derive_rank(bucket_id: str) -> int:
     return int(m.group(1)) if m else 999
 
 @app.post("/orders/group", response_model=OrderGroupResponse)
-def create_order_group(payload: CreateOrderGroupRequest, auth: dict = Depends(get_auth)):
+def create_order_group(payload: CreateOrderGroupRequest, auth: dict = Depends(get_user_ctx)):
     """
     Places a group of orders. Enforces plan gating by bucket rank and adds AMO-LIMIT buffer
     price when outside market hours (choose_order_mode decides the variety/order_type).

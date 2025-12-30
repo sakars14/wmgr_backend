@@ -10,10 +10,17 @@ class ZerodhaAdapter:
         self.api_secret = os.getenv("ZERODHA_API_SECRET", "")
 
     def _get_access_token(self, uid: str) -> str:
+        doc = self.db.collection("zerodhaConnections").document(uid).get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            token = data.get("accessToken")
+            if token:
+                return token
+
         doc = self.db.collection("users").document(uid).collection("brokerLinks").document("zerodha").get()
         if not doc.exists:
             raise RuntimeError("Zerodha not connected for user")
-        data = doc.to_dict()
+        data = doc.to_dict() or {}
         token = data.get("accessToken")
         if not token:
             raise RuntimeError("Missing access token")
@@ -61,3 +68,19 @@ class ZerodhaAdapter:
         q = kite.quote([inst])
         # Zerodha returns {'NSE:SILVERCASE': {'last_price': 18.52, ...}}
         return float(q[inst]["last_price"])
+
+    def get_quotes(self, uid: str, instruments: List[str]) -> Dict[str, float]:
+        if not instruments:
+            return {}
+        kite = self._kite(uid)
+        resp = kite.quote(instruments)
+        out: Dict[str, float] = {}
+        if isinstance(resp, dict):
+            for inst in instruments:
+                data = resp.get(inst)
+                if data and "last_price" in data:
+                    try:
+                        out[inst] = float(data["last_price"])
+                    except Exception:
+                        continue
+        return out
